@@ -42,16 +42,23 @@ class AsanaClient:
         return r.json()
 
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        items: List[Dict[str, Any]] = []
-        p = dict(params or {})
-        while True:
-            payload = self._get(path, p)
-            items.extend(payload.get("data", []))
-            next_page = payload.get("next_page")
-            if not next_page or not next_page.get("offset"):
-                break
-            p["offset"] = next_page["offset"]
-        return items
+    items: List[Dict[str, Any]] = []
+    p = dict(params or {})
+
+    # 👇 clave: forzar paginación desde la primera llamada
+    p.setdefault("limit", 100)
+
+    while True:
+        payload = self._get(path, p)
+        items.extend(payload.get("data", []))
+
+        next_page = payload.get("next_page")
+        if not next_page or not next_page.get("offset"):
+            break
+
+        p["offset"] = next_page["offset"]
+
+    return items
 
     # --- Health check ---
     def get_me(self) -> Dict[str, Any]:

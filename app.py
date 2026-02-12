@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
+import requests
 from dateutil import parser as dtparser
 
 from asana_api import AsanaClient, build_task_tree
 
-
 st.set_page_config(page_title="Asana Task Explorer", layout="wide")
-
 st.title("Asana – Tareas + Subtareas (Streamlit)")
 
 # --- Secrets ---
@@ -22,12 +21,22 @@ if not token or not workspace_id:
 
 client = AsanaClient(token)
 
+# --- Health check visible: valida token y permisos básicos ---
+try:
+    me = client.get_me()
+    user = me["data"]
+    st.caption(f"Auth OK: {user.get('name')} ({user.get('email', 'sin email')})")
+except requests.HTTPError as e:
+    st.error("Falla de autenticación/permiso con Asana. Detalle real:")
+    st.code(str(e))
+    st.stop()
+
 
 @st.cache_data(ttl=300)
 def get_projects(workspace_gid: str):
     projs = client.list_projects(workspace_gid)
-    # Filtra archivados por defecto
-    return sorted([p for p in projs if not p.get("archived")], key=lambda x: x.get("name", ""))
+    projs = [p for p in projs if not p.get("archived")]
+    return sorted(projs, key=lambda x: (x.get("name", ""), x.get("gid", "")))
 
 
 @st.cache_data(ttl=300)
@@ -35,6 +44,15 @@ def get_tasks_flat(project_gid: str, max_depth: int):
     roots = client.list_project_tasks(project_gid)
     flat = build_task_tree(client, roots, max_depth=max_depth, sleep_ms=0)
     return flat
+
+
+def parse_dt(x):
+    if not x or pd.isna(x):
+        return pd.NaT
+    try:
+        return dtparser.parse(str(x))
+    except Exception:
+        return pd.NaT
 
 
 # --- Sidebar filtros ---
@@ -46,9 +64,15 @@ with st.sidebar:
         st.warning("No se encontraron proyectos en el workspace.")
         st.stop()
 
-    proj_name_to_gid = {p["name"]: p["gid"] for p in projects}
-    project_name = st.selectbox("Proyecto", options=list(proj_name_to_gid.keys()))
-    project_gid = proj_name_to_gid[project_name]
+    # Evita colisiones por nombres duplicados: "Nombre (GID)"
+    project_options = [(p["gid"], f'{p["name"]} ({p["gid"]})') for p in projects]
+    project_label_by_gid = {gid: label for gid, label in project_options}
+
+    selected_project_gid = st.selectbox(
+        "Proyecto",
+        options=[gid for gid, _ in project_options],
+        format_func=lambda gid: project_label_by_gid.get(gid, gid),
+    )
 
     max_depth = st.slider("Profundidad (niveles)", min_value=1, max_value=5, value=3)
 
@@ -58,8 +82,11 @@ with st.sidebar:
         index=0,
     )
 
-    # Rango de deadline
-    deadline_mode = st.selectbox("Campo de deadline", options=["due_on (fecha)", "due_at (fecha+hora)"], index=0)
+    deadline_mode = st.selectbox(
+        "Campo de deadline",
+        options=["due_on (fecha)", "due_at (fecha+hora)"],
+        index=0,
+    )
     use_due_at = deadline_mode.startswith("due_at")
 
     col1, col2 = st.columns(2)
@@ -76,9 +103,14 @@ if not run:
     st.info("Elegí filtros en la barra lateral y tocá **Cargar / Actualizar**.")
     st.stop()
 
-# --- Data ---
-with st.spinner("Cargando tareas y expandiendo subtareas..."):
-    flat = get_tasks_flat(project_gid, max_depth=max_depth)
+# --- Data load con error real visible ---
+try:
+    with st.spinner("Cargando tareas y expandiendo subtareas..."):
+        flat = get_tasks_flat(selected_project_gid, max_depth=max_depth)
+except requests.HTTPError as e:
+    st.error("Error llamando a Asana. Detalle real:")
+    st.code(str(e))
+    st.stop()
 
 df = pd.DataFrame(flat)
 
@@ -86,46 +118,35 @@ if df.empty:
     st.warning("No hay tareas para mostrar.")
     st.stop()
 
-# Normalización de campos
+# --- Normalización de campos ---
 df["assignee_name"] = df.get("assignee").apply(lambda a: a.get("name") if isinstance(a, dict) else None)
 df["assignee_gid"] = df.get("assignee").apply(lambda a: a.get("gid") if isinstance(a, dict) else None)
-
-def parse_dt(x):
-    if not x or pd.isna(x):
-        return pd.NaT
-    try:
-        return dtparser.parse(str(x))
-    except Exception:
-        return pd.NaT
 
 df["due_on_dt"] = pd.to_datetime(df.get("due_on"), errors="coerce")
 df["due_at_dt"] = df.get("due_at").apply(parse_dt)
 
-# Filtro por completadas
+# --- Filtro por completadas ---
 if completed_filter == "Solo incompletas":
     df = df[df["completed"] == False]
 elif completed_filter == "Solo completadas":
     df = df[df["completed"] == True]
 
-# Filtro por deadline
-if use_due_at:
-    base = df["due_at_dt"]
-else:
-    base = df["due_on_dt"]
+# --- Filtro por deadline ---
+base = df["due_at_dt"] if use_due_at else df["due_on_dt"]
 
 if d_from is not None:
     df = df[base >= pd.Timestamp(d_from)]
 if d_to is not None:
     df = df[base <= pd.Timestamp(d_to)]
 
-# Responsable (se calcula después de filtrar lo anterior)
+# --- Responsable (después de filtros previos) ---
 assignees = sorted([a for a in df["assignee_name"].dropna().unique().tolist()])
 assignee_sel = st.selectbox("Responsable", options=["Todos"] + assignees, index=0)
 
 if assignee_sel != "Todos":
     df = df[df["assignee_name"] == assignee_sel]
 
-# Orden y columnas
+# --- Presentación ---
 df["indent_name"] = df.apply(lambda r: ("— " * int(r.get("level", 0))) + str(r.get("name", "")), axis=1)
 
 cols = [
@@ -149,6 +170,6 @@ st.dataframe(
     hide_index=True,
 )
 
-# Export
+# --- Export ---
 csv = df[cols].to_csv(index=False).encode("utf-8")
 st.download_button("Descargar CSV", data=csv, file_name="asana_tasks.csv", mime="text/csv")

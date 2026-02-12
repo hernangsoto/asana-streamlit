@@ -19,20 +19,18 @@ class AsanaClient:
         url = f"{ASANA_BASE}{path}"
         r = self.session.get(url, params=params or {}, timeout=self.timeout)
 
-        # Rate limit
+        # Rate limit handling
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", "2"))
             time.sleep(retry_after)
             r = self.session.get(url, params=params or {}, timeout=self.timeout)
 
         if r.status_code >= 400:
-            # Intento de parsear error Asana (JSON)
             try:
                 err_json = r.json()
             except Exception:
                 err_json = {"raw_text": r.text[:500]}
 
-            # Levanto un HTTPError con detalle útil (status + request id + json)
             request_id = r.headers.get("X-Request-Id") or r.headers.get("x-request-id")
             raise requests.HTTPError(
                 f"Asana API error {r.status_code} on {path} | request_id={request_id} | detail={err_json}",
@@ -42,39 +40,46 @@ class AsanaClient:
         return r.json()
 
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    p = dict(params or {})
+        items: List[Dict[str, Any]] = []
+        p = dict(params or {})
 
-    # 👇 clave: forzar paginación desde la primera llamada
-    p.setdefault("limit", 100)
+        # IMPORTANT: force pagination from the first request
+        p.setdefault("limit", 100)
 
-    while True:
-        payload = self._get(path, p)
-        items.extend(payload.get("data", []))
+        while True:
+            payload = self._get(path, p)
+            items.extend(payload.get("data", []))
 
-        next_page = payload.get("next_page")
-        if not next_page or not next_page.get("offset"):
-            break
+            next_page = payload.get("next_page")
+            if not next_page or not next_page.get("offset"):
+                break
 
-        p["offset"] = next_page["offset"]
+            p["offset"] = next_page["offset"]
 
-    return items
+        return items
 
     # --- Health check ---
     def get_me(self) -> Dict[str, Any]:
-        return self._get("/users/me", params={"opt_fields": "gid,name,email,workspaces.gid,workspaces.name"})
+        return self._get(
+            "/users/me",
+            params={"opt_fields": "gid,name,email,workspaces.gid,workspaces.name"},
+        )
 
     def list_projects(self, workspace_gid: str) -> List[Dict[str, Any]]:
         return self.paginate(
             "/projects",
-            params={"workspace": workspace_gid, "opt_fields": "gid,name,archived,permalink_url"},
+            params={
+                "workspace": workspace_gid,
+                "opt_fields": "gid,name,archived,permalink_url",
+                "limit": 100,
+            },
         )
 
     def list_project_tasks(self, project_gid: str) -> List[Dict[str, Any]]:
-        # Simplifico opt_fields para evitar cualquier field raro
         return self.paginate(
             f"/projects/{project_gid}/tasks",
             params={
+                "limit": 100,
                 "opt_fields": ",".join(
                     [
                         "gid",
@@ -86,8 +91,10 @@ class AsanaClient:
                         "assignee.gid",
                         "assignee.name",
                         "permalink_url",
+                        "parent.gid",
+                        "parent.name",
                     ]
-                )
+                ),
             },
         )
 
@@ -95,6 +102,7 @@ class AsanaClient:
         return self.paginate(
             f"/tasks/{task_gid}/subtasks",
             params={
+                "limit": 100,
                 "opt_fields": ",".join(
                     [
                         "gid",
@@ -106,8 +114,10 @@ class AsanaClient:
                         "assignee.gid",
                         "assignee.name",
                         "permalink_url",
+                        "parent.gid",
+                        "parent.name",
                     ]
-                )
+                ),
             },
         )
 
@@ -119,8 +129,8 @@ def build_task_tree(
     sleep_ms: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Devuelve una lista 'plana' con todas las tareas + subtareas hasta max_depth.
-    Agrega campos: level (0..), root_gid, root_name.
+    Devuelve una lista plana con todas las tareas + subtareas hasta max_depth.
+    Agrega: level (0..), root_gid, root_name.
     """
     out: List[Dict[str, Any]] = []
 

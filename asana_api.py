@@ -43,7 +43,7 @@ class AsanaClient:
         items: List[Dict[str, Any]] = []
         p = dict(params or {})
 
-        # IMPORTANT: force pagination from the first request
+        # IMPORTANT: force pagination from the first request (evita "result too large")
         p.setdefault("limit", 100)
 
         while True:
@@ -121,6 +121,36 @@ class AsanaClient:
             },
         )
 
+    def search_tasks_for_workspace(self, workspace_gid: str, search_params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Advanced Search:
+        GET /workspaces/{workspace_gid}/tasks/search
+
+        Nota: este endpoint puede no estar habilitado en algunos planes.
+        """
+        params = dict(search_params)
+        params.setdefault(
+            "opt_fields",
+            ",".join(
+                [
+                    "gid",
+                    "name",
+                    "completed",
+                    "completed_at",
+                    "due_on",
+                    "due_at",
+                    "assignee.gid",
+                    "assignee.name",
+                    "permalink_url",
+                    "parent.gid",
+                    "parent.name",
+                ]
+            ),
+        )
+        params.setdefault("limit", 100)
+
+        return self.paginate(f"/workspaces/{workspace_gid}/tasks/search", params=params)
+
 
 ProgressCb = Optional[Callable[[Dict[str, Any]], None]]
 
@@ -134,10 +164,9 @@ def build_task_tree(
 ) -> List[Dict[str, Any]]:
     """
     Devuelve una lista plana con todas las tareas + subtareas hasta max_depth.
-    progress_cb: función opcional que recibe dict con: visited, queued, depth, current_name.
+    progress_cb recibe dict con: visited, queued, depth, current_name
     """
     out: List[Dict[str, Any]] = []
-
     visited = 0
     queued = len(root_tasks)
 

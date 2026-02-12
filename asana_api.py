@@ -40,6 +40,7 @@ class AsanaClient:
         return r.json()
 
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        # 👇 ESTA LINEA DEBE QUEDAR DENTRO DE paginate() (indentada)
         items: List[Dict[str, Any]] = []
         p = dict(params or {})
 
@@ -58,7 +59,6 @@ class AsanaClient:
 
         return items
 
-    # --- Health check ---
     def get_me(self) -> Dict[str, Any]:
         return self._get(
             "/users/me",
@@ -128,10 +128,6 @@ def build_task_tree(
     max_depth: int = 3,
     sleep_ms: int = 0,
 ) -> List[Dict[str, Any]]:
-    """
-    Devuelve una lista plana con todas las tareas + subtareas hasta max_depth.
-    Agrega: level (0..), root_gid, root_name.
-    """
     out: List[Dict[str, Any]] = []
 
     def walk(task: Dict[str, Any], level: int, root: Dict[str, Any]) -> None:

@@ -39,13 +39,6 @@ def get_projects(workspace_gid: str):
     return sorted(projs, key=lambda x: (x.get("name", ""), x.get("gid", "")))
 
 
-@st.cache_data(ttl=300)
-def get_tasks_flat(project_gid: str, max_depth: int):
-    roots = client.list_project_tasks(project_gid)
-    flat = build_task_tree(client, roots, max_depth=max_depth, sleep_ms=0)
-    return flat
-
-
 def parse_dt(x):
     if not x or pd.isna(x):
         return pd.NaT
@@ -103,10 +96,55 @@ if not run:
     st.info("Elegí filtros en la barra lateral y tocá **Cargar / Actualizar**.")
     st.stop()
 
-# --- Data load con error real visible ---
+
+# --- Data load con progreso ---
+progress_bar = st.progress(0, text="Iniciando…")
+status_box = st.empty()
+
 try:
-    with st.spinner("Cargando tareas y expandiendo subtareas..."):
-        flat = get_tasks_flat(selected_project_gid, max_depth=max_depth)
+    with st.spinner("Cargando tareas raíz…"):
+        roots = client.list_project_tasks(selected_project_gid)
+
+    total_roots = len(roots)
+    if total_roots == 0:
+        st.warning("Este proyecto no tiene tareas.")
+        st.stop()
+
+    approx_total = max(total_roots, 1)
+
+    # Guardamos total estimado "expandible" en atributos del callback
+    def progress_cb(info: dict):
+        visited = int(info.get("visited", 0))
+        depth = int(info.get("depth", 0))
+        name = str(info.get("current_name", ""))
+
+        # total estimado ajustable
+        cur_total = getattr(progress_cb, "approx_total", approx_total)
+        if visited > cur_total:
+            cur_total = int(visited * 1.5)
+            setattr(progress_cb, "approx_total", cur_total)
+
+        pct = min(int((visited / max(cur_total, 1)) * 100), 99)
+        progress_bar.progress(pct, text=f"Procesando… ({visited} items)")
+
+        status_box.markdown(
+            f"**Procesadas:** {visited}  \n"
+            f"**Nivel:** {depth}  \n"
+            f"**Actual:** {name}"
+        )
+
+    with st.spinner("Expandiendo subtareas…"):
+        flat = build_task_tree(
+            client,
+            roots,
+            max_depth=max_depth,
+            sleep_ms=0,
+            progress_cb=progress_cb,
+        )
+
+    progress_bar.progress(100, text="Listo ✅")
+    status_box.success(f"Completado: {len(flat)} items (tareas + subtareas).")
+
 except requests.HTTPError as e:
     st.error("Error llamando a Asana. Detalle real:")
     st.code(str(e))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import re
 import pandas as pd
 import streamlit as st
 import requests
@@ -11,6 +12,8 @@ from asana_api import AsanaClient, build_task_tree
 
 st.set_page_config(page_title="Asana Task Explorer", layout="wide")
 st.title("Asana – Tareas + Subtareas (Streamlit)")
+
+CUSTOM_FIELD_NAME = "Medios | Tiempo de tarea"
 
 usuarios = [
     {"nombre": "Nicolás Billia", "user_id": "1189529235923826"},
@@ -59,12 +62,69 @@ def parse_dt(x):
         return pd.NaT
 
 
+def extraer_medio(nombre_tarea: str) -> str:
+    if not nombre_tarea:
+        return "Sin medio"
+    match = re.search(r"\[(.*?)\]", nombre_tarea)
+    if match:
+        contenido = match.group(1)
+        if "-" in contenido:
+            return contenido.split("-")[0].strip()
+        return contenido.strip()
+    return "Sin medio"
+
+
+def extraer_proyectos(task: dict) -> str:
+    """
+    Devuelve una lista de proyectos (nombres) desde memberships.
+    """
+    memberships = task.get("memberships") or []
+    names = []
+    for m in memberships:
+        if isinstance(m, dict):
+            p = m.get("project")
+            if isinstance(p, dict) and p.get("name"):
+                names.append(p["name"])
+    # unique manteniendo orden
+    seen = set()
+    uniq = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return ", ".join(uniq) if uniq else ""
+
+
+def extraer_custom_field(task: dict, field_name: str) -> str:
+    """
+    Busca el custom field por nombre y devuelve display_value o fallback.
+    """
+    cfs = task.get("custom_fields") or []
+    for cf in cfs:
+        if isinstance(cf, dict) and cf.get("name") == field_name:
+            # Preferimos display_value (ya viene human-readable)
+            dv = cf.get("display_value")
+            if dv not in (None, ""):
+                return str(dv)
+            # fallbacks
+            if cf.get("text_value") not in (None, ""):
+                return str(cf["text_value"])
+            if cf.get("number_value") not in (None, ""):
+                return str(cf["number_value"])
+            ev = cf.get("enum_value")
+            if isinstance(ev, dict) and ev.get("name"):
+                return str(ev["name"])
+            return ""
+    return ""
+
+
 with st.sidebar:
     st.header("Filtros")
 
     filter_by_project = st.checkbox("Filtrar por proyecto", value=True)
 
     selected_project_gid = None
+    selected_project_label = ""
     if filter_by_project:
         projects = get_projects(workspace_id)
         if not projects:
@@ -79,6 +139,7 @@ with st.sidebar:
             options=[gid for gid, _ in project_options],
             format_func=lambda gid: label_by_gid.get(gid, gid),
         )
+        selected_project_label = label_by_gid.get(selected_project_gid, "")
     else:
         st.info("Modo workspace: se usa búsqueda avanzada por usuarios (si está disponible).")
 
@@ -118,8 +179,35 @@ def load_roots() -> list[dict]:
     if filter_by_project:
         return client.list_project_tasks(selected_project_gid)
 
+    # Workspace search
     params: dict = {}
-    params["assignee.any"] = ",".join(selected_user_ids)
+
+    # Validar user_ids seleccionados (evita "Not a recognized ID")
+    valid_user_ids = []
+    invalid_user_ids = []
+
+    for uid in selected_user_ids:
+        try:
+            u = client.get_user(uid)["data"]
+            ws_gids = {w.get("gid") for w in (u.get("workspaces") or []) if isinstance(w, dict)}
+            if workspace_id in ws_gids:
+                valid_user_ids.append(uid)
+            else:
+                invalid_user_ids.append(uid)
+        except requests.HTTPError:
+            invalid_user_ids.append(uid)
+
+    if invalid_user_ids:
+        st.warning(
+            "Estos user_id no son válidos o no pertenecen al workspace y se omitieron:\n- "
+            + "\n- ".join(invalid_user_ids)
+        )
+
+    if not valid_user_ids:
+        st.error("No quedó ningún usuario válido para buscar en este workspace.")
+        st.stop()
+
+    params["assignee.any"] = ",".join(valid_user_ids)
 
     if completed_filter == "Solo incompletas":
         params["completed"] = "false"
@@ -128,7 +216,6 @@ def load_roots() -> list[dict]:
 
     if d_from is not None:
         params["due_at.after" if use_due_at else "due_on.after"] = str(d_from)
-
     if d_to is not None:
         params["due_at.before" if use_due_at else "due_on.before"] = str(d_to)
 
@@ -147,7 +234,6 @@ try:
         st.warning("No se encontraron tareas con esos filtros.")
         st.stop()
 
-    # Estado mutable para el callback (evita nonlocal)
     state = {
         "approx_total": max(total_roots, 1),
         "last_ui_ts": time.time(),
@@ -195,17 +281,33 @@ if df.empty:
     st.warning("No hay tareas para mostrar.")
     st.stop()
 
+# Normalización básica
 df["assignee_name"] = df.get("assignee").apply(lambda a: a.get("name") if isinstance(a, dict) else None)
 df["assignee_gid"] = df.get("assignee").apply(lambda a: a.get("gid") if isinstance(a, dict) else None)
+
+df["created_at_dt"] = df.get("created_at").apply(parse_dt)
+df["completed_at_dt"] = df.get("completed_at").apply(parse_dt)
 
 df["due_on_dt"] = pd.to_datetime(df.get("due_on"), errors="coerce")
 df["due_at_dt"] = df.get("due_at").apply(parse_dt)
 
-# Filtrado por usuarios siempre (modo proyecto y modo workspace)
+# Campos pedidos
+df["medio"] = df.get("name").fillna("").apply(extraer_medio)
+
+# proyecto desde memberships (puede ser múltiple)
+df["proyecto"] = df.apply(lambda r: extraer_proyectos(r.to_dict()), axis=1)
+
+# fallback: si estás filtrando por un proyecto y no hay memberships, usa el seleccionado
+if filter_by_project and selected_project_label:
+    df.loc[df["proyecto"].fillna("").str.strip() == "", "proyecto"] = selected_project_label.split(" (")[0].strip()
+
+df["tiempo_tarea"] = df.apply(lambda r: extraer_custom_field(r.to_dict(), CUSTOM_FIELD_NAME), axis=1)
+
+# Filtrado por usuarios siempre
 if len(selected_user_ids) > 0:
     df = df[df["assignee_gid"].isin(selected_user_ids)]
 
-# Filtros client-side cuando el modo es proyecto
+# Filtros client-side extra cuando el modo es proyecto
 if filter_by_project:
     if completed_filter == "Solo incompletas":
         df = df[df["completed"] == False]
@@ -218,19 +320,54 @@ if filter_by_project:
     if d_to is not None:
         df = df[base <= pd.Timestamp(d_to)]
 
+# Presentación
 df["indent_name"] = df.apply(lambda r: ("— " * int(r.get("level", 0))) + str(r.get("name", "")), axis=1)
 
-cols = ["indent_name", "level", "completed", "due_on", "due_at", "assignee_name", "permalink_url"]
-for c in cols:
+# Columnas para UI
+cols_ui = [
+    "medio",
+    "proyecto",
+    "indent_name",
+    "level",
+    "completed",
+    "created_at",
+    "completed_at",
+    "due_on",
+    "due_at",
+    "assignee_name",
+    "tiempo_tarea",
+    "permalink_url",
+]
+for c in cols_ui:
     if c not in df.columns:
         df[c] = None
 
 st.subheader("Resultados")
+
 st.dataframe(
-    df[cols].rename(columns={"indent_name": "tarea"}),
+    df[cols_ui].rename(columns={"indent_name": "tarea"}),
     use_container_width=True,
     hide_index=True,
 )
 
-csv = df[cols].to_csv(index=False).encode("utf-8")
+# Export CSV con lo pedido
+cols_export = [
+    "medio",
+    "proyecto",
+    "name",
+    "level",
+    "completed",
+    "created_at",
+    "completed_at",
+    "due_on",
+    "due_at",
+    "assignee_name",
+    "tiempo_tarea",
+    "permalink_url",
+]
+for c in cols_export:
+    if c not in df.columns:
+        df[c] = None
+
+csv = df[cols_export].to_csv(index=False).encode("utf-8")
 st.download_button("Descargar CSV", data=csv, file_name="asana_tasks.csv", mime="text/csv")

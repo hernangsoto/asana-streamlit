@@ -19,7 +19,6 @@ class AsanaClient:
         url = f"{ASANA_BASE}{path}"
         r = self.session.get(url, params=params or {}, timeout=self.timeout)
 
-        # Rate limit handling
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", "2"))
             time.sleep(retry_after)
@@ -42,9 +41,7 @@ class AsanaClient:
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         p = dict(params or {})
-
-        # IMPORTANT: force pagination from the first request (evita "result too large")
-        p.setdefault("limit", 100)
+        p.setdefault("limit", 100)  # evita "result too large"
 
         while True:
             payload = self._get(path, p)
@@ -65,6 +62,12 @@ class AsanaClient:
             params={"opt_fields": "gid,name,email,workspaces.gid,workspaces.name"},
         )
 
+    def get_user(self, user_gid: str) -> Dict[str, Any]:
+        return self._get(
+            f"/users/{user_gid}",
+            params={"opt_fields": "gid,name,email,workspaces.gid"},
+        )
+
     def list_projects(self, workspace_gid: str) -> List[Dict[str, Any]]:
         return self.paginate(
             "/projects",
@@ -75,26 +78,43 @@ class AsanaClient:
             },
         )
 
+    def _task_opt_fields(self) -> str:
+        # Campos extra que pediste: created_at, memberships (para proyecto/medio),
+        # y custom_fields (para "Medios | Tiempo de tarea")
+        return ",".join(
+            [
+                "gid",
+                "name",
+                "created_at",
+                "completed",
+                "completed_at",
+                "due_on",
+                "due_at",
+                "assignee.gid",
+                "assignee.name",
+                "permalink_url",
+                "parent.gid",
+                "parent.name",
+                "memberships.project.gid",
+                "memberships.project.name",
+                "memberships.section.gid",
+                "memberships.section.name",
+                "custom_fields.gid",
+                "custom_fields.name",
+                "custom_fields.type",
+                "custom_fields.display_value",
+                "custom_fields.number_value",
+                "custom_fields.text_value",
+                "custom_fields.enum_value.name",
+            ]
+        )
+
     def list_project_tasks(self, project_gid: str) -> List[Dict[str, Any]]:
         return self.paginate(
             f"/projects/{project_gid}/tasks",
             params={
                 "limit": 100,
-                "opt_fields": ",".join(
-                    [
-                        "gid",
-                        "name",
-                        "completed",
-                        "completed_at",
-                        "due_on",
-                        "due_at",
-                        "assignee.gid",
-                        "assignee.name",
-                        "permalink_url",
-                        "parent.gid",
-                        "parent.name",
-                    ]
-                ),
+                "opt_fields": self._task_opt_fields(),
             },
         )
 
@@ -103,52 +123,14 @@ class AsanaClient:
             f"/tasks/{task_gid}/subtasks",
             params={
                 "limit": 100,
-                "opt_fields": ",".join(
-                    [
-                        "gid",
-                        "name",
-                        "completed",
-                        "completed_at",
-                        "due_on",
-                        "due_at",
-                        "assignee.gid",
-                        "assignee.name",
-                        "permalink_url",
-                        "parent.gid",
-                        "parent.name",
-                    ]
-                ),
+                "opt_fields": self._task_opt_fields(),
             },
         )
 
     def search_tasks_for_workspace(self, workspace_gid: str, search_params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Advanced Search:
-        GET /workspaces/{workspace_gid}/tasks/search
-
-        Nota: este endpoint puede no estar habilitado en algunos planes.
-        """
         params = dict(search_params)
-        params.setdefault(
-            "opt_fields",
-            ",".join(
-                [
-                    "gid",
-                    "name",
-                    "completed",
-                    "completed_at",
-                    "due_on",
-                    "due_at",
-                    "assignee.gid",
-                    "assignee.name",
-                    "permalink_url",
-                    "parent.gid",
-                    "parent.name",
-                ]
-            ),
-        )
         params.setdefault("limit", 100)
-
+        params.setdefault("opt_fields", self._task_opt_fields())
         return self.paginate(f"/workspaces/{workspace_gid}/tasks/search", params=params)
 
 
@@ -162,10 +144,6 @@ def build_task_tree(
     sleep_ms: int = 0,
     progress_cb: ProgressCb = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Devuelve una lista plana con todas las tareas + subtareas hasta max_depth.
-    progress_cb recibe dict con: visited, queued, depth, current_name
-    """
     out: List[Dict[str, Any]] = []
     visited = 0
     queued = len(root_tasks)

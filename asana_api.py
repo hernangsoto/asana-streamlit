@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-
 ASANA_BASE = "https://app.asana.com/api/1.0"
 
 
@@ -19,12 +18,27 @@ class AsanaClient:
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{ASANA_BASE}{path}"
         r = self.session.get(url, params=params or {}, timeout=self.timeout)
-        # Manejo simple de rate limits (429)
+
+        # Rate limit
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", "2"))
             time.sleep(retry_after)
             r = self.session.get(url, params=params or {}, timeout=self.timeout)
-        r.raise_for_status()
+
+        if r.status_code >= 400:
+            # Intento de parsear error Asana (JSON)
+            try:
+                err_json = r.json()
+            except Exception:
+                err_json = {"raw_text": r.text[:500]}
+
+            # Levanto un HTTPError con detalle útil (status + request id + json)
+            request_id = r.headers.get("X-Request-Id") or r.headers.get("x-request-id")
+            raise requests.HTTPError(
+                f"Asana API error {r.status_code} on {path} | request_id={request_id} | detail={err_json}",
+                response=r,
+            )
+
         return r.json()
 
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -32,29 +46,25 @@ class AsanaClient:
         p = dict(params or {})
         while True:
             payload = self._get(path, p)
-            data = payload.get("data", [])
-            items.extend(data)
-
+            items.extend(payload.get("data", []))
             next_page = payload.get("next_page")
             if not next_page or not next_page.get("offset"):
                 break
-
             p["offset"] = next_page["offset"]
         return items
 
-    # --- Lecturas principales ---
+    # --- Health check ---
+    def get_me(self) -> Dict[str, Any]:
+        return self._get("/users/me", params={"opt_fields": "gid,name,email,workspaces.gid,workspaces.name"})
 
     def list_projects(self, workspace_gid: str) -> List[Dict[str, Any]]:
         return self.paginate(
             "/projects",
-            params={
-                "workspace": workspace_gid,
-                "opt_fields": "gid,name,archived,permalink_url",
-            },
+            params={"workspace": workspace_gid, "opt_fields": "gid,name,archived,permalink_url"},
         )
 
     def list_project_tasks(self, project_gid: str) -> List[Dict[str, Any]]:
-        # Nota: esto trae tareas del proyecto (no todas las subtareas); luego se expande recursivo
+        # Simplifico opt_fields para evitar cualquier field raro
         return self.paginate(
             f"/projects/{project_gid}/tasks",
             params={
@@ -69,8 +79,6 @@ class AsanaClient:
                         "assignee.gid",
                         "assignee.name",
                         "permalink_url",
-                        "parent.gid",
-                        "parent.name",
                     ]
                 )
             },
@@ -91,8 +99,6 @@ class AsanaClient:
                         "assignee.gid",
                         "assignee.name",
                         "permalink_url",
-                        "parent.gid",
-                        "parent.name",
                     ]
                 )
             },

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import requests
 
@@ -40,7 +40,6 @@ class AsanaClient:
         return r.json()
 
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        # 👇 ESTA LINEA DEBE QUEDAR DENTRO DE paginate() (indentada)
         items: List[Dict[str, Any]] = []
         p = dict(params or {})
 
@@ -59,6 +58,7 @@ class AsanaClient:
 
         return items
 
+    # --- Health check ---
     def get_me(self) -> Dict[str, Any]:
         return self._get(
             "/users/me",
@@ -122,20 +122,48 @@ class AsanaClient:
         )
 
 
+ProgressCb = Optional[Callable[[Dict[str, Any]], None]]
+
+
 def build_task_tree(
     client: AsanaClient,
     root_tasks: List[Dict[str, Any]],
     max_depth: int = 3,
     sleep_ms: int = 0,
+    progress_cb: ProgressCb = None,
 ) -> List[Dict[str, Any]]:
+    """
+    Devuelve una lista plana con todas las tareas + subtareas hasta max_depth.
+    progress_cb: función opcional que recibe dict con: visited, queued, depth, current_name.
+    """
     out: List[Dict[str, Any]] = []
 
+    visited = 0
+    queued = len(root_tasks)
+
+    def emit(current_name: str, depth: int):
+        if callable(progress_cb):
+            progress_cb(
+                {
+                    "visited": visited,
+                    "queued": queued,
+                    "depth": depth,
+                    "current_name": current_name,
+                }
+            )
+
     def walk(task: Dict[str, Any], level: int, root: Dict[str, Any]) -> None:
+        nonlocal visited, queued
+
+        visited += 1
+
         enriched = dict(task)
         enriched["level"] = level
         enriched["root_gid"] = root.get("gid")
         enriched["root_name"] = root.get("name")
         out.append(enriched)
+
+        emit(str(task.get("name", "")), level)
 
         if level + 1 >= max_depth:
             return
@@ -144,6 +172,7 @@ def build_task_tree(
             time.sleep(sleep_ms / 1000.0)
 
         subs = client.list_subtasks(task["gid"])
+        queued += len(subs)
         for st in subs:
             walk(st, level + 1, root)
 
